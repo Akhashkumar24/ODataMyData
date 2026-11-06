@@ -284,3 +284,28 @@ class DiscoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EndToEndTests(unittest.TestCase):
+    """The whole Runner against a stub that ignores every query option: every step runs, nothing crashes,
+    and each category catches the misbehaviour it exists for."""
+
+    def run_stub(self, **kw):
+        from odh_odata.__main__ import build_parser
+        from tests.stub import StubService
+        opts = vars(build_parser().parse_args(["x"]))
+        opts.update(workers=1, verbose=False)
+        stub = StubService(**kw)
+        r = Runner(stub, metadata.parse(V4), "", SimpleNamespace(**opts), log=lambda *_: None)
+        return stub, r.run()
+
+    def test_ignoring_service_is_caught_everywhere(self):
+        stub, results = self.run_stub()
+        crashes = [x for x in results if x.category == "internal" or any("validator crashed" in m for _, m in x.notes)]
+        self.assertEqual(crashes, [])
+        failed = {x.category for x in results if x.outcome == FAIL}
+        for cat in ("filter", "orderby", "negative", "count", "select", "expand", "paging"):
+            self.assertIn(cat, failed, f"no FAIL in {cat}")
+        self.assertTrue(any(x.category == "key" and x.outcome == PASS for x in results))
+        self.assertTrue(any(x.category == "security" and x.outcome == PASS for x in results))
+        self.assertTrue(any(x.category == "crawl" for x in results))
