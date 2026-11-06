@@ -65,6 +65,7 @@ class Result:
     id: int | None = None
     curl: str = ""
     response: str | None = None  # captured response file, relative to the run folder
+    baseline: str | None = None  # "new" when --baseline is used and this finding is not in it
 
 
 class Expr:
@@ -168,3 +169,4 @@ class Ctx:
     total: int | None = None
     expanded: dict = field(default_factory=dict)  # nav -> rows that had it expanded
     ne_gaps: list = field(default_factory=list)  # properties whose 'ne' drops null rows
+    unsupported_fns: set = field(default_factory=set)  # filter functions skipped because FilterFunctions omits them

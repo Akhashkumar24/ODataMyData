@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import itertools
-import json
+import re
 import threading
 import traceback
 from collections import Counter
@@ -18,9 +18,10 @@ from .expand import ExpandTests
 from .filters import FilterTests
 from .keys import KeyTests
 from .negative import NegativeTests
+from .batch import BatchTests
 
 
-class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, NegativeTests):
+class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, NegativeTests, BatchTests):
     def __init__(self, client, model, root, opts, log=print, base_filters=None, capture_dir=None):
         self.c, self.m, self.root, self.o, self._log = client, model, root.strip("/"), opts, log
         self.base_filters = {k: v for k, v in (base_filters or {}).items() if v}  # set -> user $filter scope
@@ -33,6 +34,23 @@ class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, Negati
         self.results, self.visited = [], set()
         self._lock = threading.Lock()
         self.cparam = {"$count": "true"} if self.v4 else {"$inlinecount": "allpages"}
+        self.errors_5xx = Counter()  # (set, property) -> server errors so far
+        self._caps = {}
+
+    BREAK_5XX = 3  # after this many 5xx involving one property, later requests on it are skipped
+
+    def caps(self, set_name):
+        if set_name not in self._caps:
+            self._caps[set_name] = self.m.caps(set_name)
+        return self._caps[set_name]
+
+    def unsupported(self, path, params):
+        """Drop $top from collection requests on a set whose metadata says TopSupported=false."""
+        head = path.split("?")[0].lstrip("/")
+        seg = head.split("/")[0]
+        if params and "$top" in params and seg in self.m.sets and head in (seg, f"{seg}/$count") and not self.caps(seg).top:
+            params = {k: v for k, v in params.items() if k != "$top"}
+        return params
 
     @property
     def thorough(self):
@@ -70,15 +88,14 @@ class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, Negati
     def capture(self, res, r):
         if not self.capture_dir:
             return
-        body = r.text or ""
-        if isinstance(r.json, (dict, list)) and len(body) < 2_000_000:
-            body = json.dumps(r.json, indent=2, default=str)
+        if getattr(self.o, "capture", "all") == "failures" and res.outcome not in (FAIL, WARN):
+            return  # default: keep evidence for findings only; passing responses hold data nobody needs to read
         name = f"{res.id:05d}.txt"
         head = "\n".join(f"{k}: {v}" for k, v in r.headers.items() if k.lower() != "set-cookie")
         trunc = "  [body truncated]" if r.truncated else ""
-        (self.capture_dir / name).write_text(
-            f"# {res.set} | {res.category} | {res.name}\n{res.curl}\n\nHTTP {r.status} ({r.ms} ms){trunc}\n{head}\n\n{body[:262144]}",
-            encoding="utf-8")
+        # raw body, not re-serialised: replay must see exactly what the server sent
+        with open(self.capture_dir / name, "w", encoding="utf-8", newline="") as f:
+            f.write(f"# {res.set} | {res.category} | {res.name}\n{res.curl}\n\nHTTP {r.status} ({r.ms} ms){trunc}\n{head}\n\n{r.text or ''}")
         res.response = f"responses/{name}"
 
     def url(self, path, params=None):
@@ -163,21 +180,34 @@ class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, Negati
                           f"{res.status} {res.ms}ms  {first[:160]}")
 
     def check(self, set_, cat, name, path, params=None, expect="ok", validate=None, headers=None,
-              auth=True, token=None, optional=False, max_bytes=20_000_000):
-        """One GET judged against `expect` (ok|error|notfound|denied|denied_soft|error_soft); validate(r) -> notes."""
+              auth=True, token=None, optional=False, max_bytes=20_000_000, prop=None, data=None):
+        """One request judged against `expect` (ok|error|notfound|denied|denied_soft|error_soft); validate(r) -> notes.
+        prop names the property under test, so repeated server errors on it stop further requests on it.
+        data makes it a POST (only used for $batch, whose inner requests are all GETs)."""
         res = Result(set_, cat, name, id=next(self._ids))
+        with self._lock:
+            broken = prop is not None and self.errors_5xx[(set_, prop)] >= self.BREAK_5XX
+        if broken:
+            res.outcome, res.notes = SKIP, [(SKIP, f"skipped: '{prop}' already caused {self.BREAK_5XX} server errors")]
+            self._add(res)
+            return None, res
         if "x-correlation-id" not in {k.lower() for k in self.c.extra}:  # lets the API team find this request in server logs
             headers = {**(headers or {}), "X-Correlation-ID": f"{self.run_id}-{res.id:05d}"}
         params = self.scope(path, params)
+        if expect == "ok":
+            params = self.unsupported(path, params)
         try:
-            r = self.c.get(self.url(path, params), headers=headers, auth=auth, token=token, max_bytes=max_bytes)
+            u = self.url(path, params)
+            r = (self.c.post(u, data, headers=headers, max_bytes=max_bytes) if data is not None
+                 else self.c.get(u, headers=headers, auth=auth, token=token, max_bytes=max_bytes))
         except BudgetExceeded as e:
             res.outcome, res.notes = SKIP, [(SKIP, str(e) or "request budget exhausted")]
             self._add(res)
             return None, res
         res.url, res.status, res.ms = r.url, r.status, r.ms
         res.curl = self.curl(r.url, {"Accept": "application/json", **self.c.extra, **(headers or {})}, auth, token)
-        self.capture(res, r)
+        if data is not None:
+            res.curl = res.curl.replace("curl -sk", "curl -sk -X POST --data-binary @batch-body.txt", 1)
         st, notes, snip = r.status, [], (r.text or "")[:200].replace("\n", " ")
         if r.error:
             notes.append((FAIL, f"transport error: {r.error}"))
@@ -222,11 +252,19 @@ class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, Negati
                 notes.append((WARN, f"unexpected {st} for unauthenticated request"))
         if r.ms and r.ms > self.o.slow_ms:
             notes.append((WARN, f"slow response: {r.ms} ms (> {self.o.slow_ms})"))
+        if prop is not None and st and st >= 500:
+            notes.insert(0, (FAIL, f"server error {st} involving property '{prop}'"))  # groups findings by cause
+            with self._lock:
+                self.errors_5xx[(set_, prop)] += 1
         res.notes = compress(notes)
         res.outcome = max((lvl for lvl, _ in res.notes), key=lambda x: RANK[x], default=PASS)
         res.outcome = PASS if RANK[res.outcome] == 0 else res.outcome
         rows = self.rows(r)
         res.rows = len(rows) if rows is not None else None
+        self.capture(res, r)
+        if data is not None and res.response:
+            with open(self.capture_dir / res.response.split("/")[-1], "a", encoding="utf-8", newline="") as f:
+                f.write(f"\n\n# request body (batch-body.txt)\n{data}")
         self._add(res)
         return r, res
 
@@ -255,6 +293,9 @@ class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, Negati
                 notes.append((WARN, f"{where}: '{k}' returned although not in $select"))
             elif k in T.navs and k not in expand:
                 notes.append((WARN, f"{where}: navigation '{k}' inlined without $expand"))
+        for n in expand:
+            if n in T.navs and n not in obj:
+                notes.append((FAIL, f"{where}: expanded '{n}' missing"))
         props = T.properties if select is None else {k: T.properties[k] for k in select if k in T.properties}
         for name, p in props.items():
             if name not in obj:
@@ -296,7 +337,7 @@ class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, Negati
             if rows is None:
                 return [(FAIL, "response is not an OData collection (no 'value' array)")]
             notes = []
-            if top is not None and len(rows) > top:
+            if top is not None and len(rows) > top and re.search(r"[?&]\$top=", r.url or ""):  # only if $top was sent
                 notes.append((FAIL, f"returned {len(rows)} rows for $top={top}"))
             for row in rows:
                 notes += self.soften(self.validate_struct(tqn, row, "row", select, expand))
@@ -362,15 +403,17 @@ class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, Negati
             return notes
         return v
 
-    def nav_checks(self, S_T, nav, rows):
-        """Shape, schema and referential integrity of an expanded navigation on each row."""
+    def nav_checks(self, S_T, nav, rows, require=True):
+        """Shape, schema and referential integrity of an expanded navigation on each row.
+        require=False where validate_struct(expand=...) already reports a missing navigation."""
         notes = []
         pairs, kind = self.m.fk_pairs(S_T.name, nav)
         lvl = FAIL if kind == "declared" else WARN
         for row in rows:
             val = row.get(nav.name, _MISSING)
             if val is _MISSING:
-                notes.append((FAIL, f"expanded '{nav.name}' missing from row"))
+                if require:
+                    notes.append((FAIL, f"expanded '{nav.name}' missing from row"))
                 continue
             if nav.collection != isinstance(val, list) and val is not None:
                 notes.append((FAIL, f"'{nav.name}' should be {'an array' if nav.collection else 'an object'}"))
@@ -402,6 +445,7 @@ class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, Negati
                                  notes=[(FAIL, f"'{n}' not in metadata; did you mean {close}?")]))
         with ThreadPoolExecutor(max(1, self.o.workers)) as ex:
             list(ex.map(self._safe_set, names))
+        self.t_batch(names)
         return self.results
 
     def _safe_set(self, name):
@@ -420,7 +464,7 @@ class Runner(ServiceTests, ReadTests, ExpandTests, FilterTests, KeyTests, Negati
         if T is None:
             self._add(Result(name, "metadata", "entity type resolvable", outcome=FAIL, notes=[(FAIL, f"unknown type {es.type}")]))
             return
-        S = Ctx(name, T, self.m.caps(name), self.scalars(T), es.bindings)
+        S = Ctx(name, T, self.caps(name), self.scalars(T), es.bindings)
         if es.singleton:
             self.check(name, "read", "singleton", name, validate=self.entity_check(T))
             return

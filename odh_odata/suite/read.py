@@ -111,7 +111,7 @@ class ReadTests:
         k = min(3, self.o.sample)
         for p in self._limit(props, key=lambda n: S.T.properties[n].type, S=S):
             self.check(S.name, "select", f"$select={p}", S.name, {"$select": p, "$top": k},
-                       validate=self.rows_check(S.T.name, select=[p], top=k))
+                       validate=self.rows_check(S.T.name, select=[p], top=k), prop=p)
         multi = props[: max(2, len(props) // 2)]
         self.check(S.name, "select", f"$select {len(multi)} properties", S.name, {"$select": ",".join(multi), "$top": k},
                    validate=self.rows_check(S.T.name, select=multi, top=k))
@@ -134,7 +134,8 @@ class ReadTests:
                 spec = [(p, desc, t)]
                 self.check(S.name, "orderby", f"$orderby={p} {'desc' if desc else 'asc'}", S.name,
                            {"$orderby": f"{p} desc" if desc else f"{p} asc", "$top": n},
-                           validate=self.rows_check(S.T.name, top=n, extra=lambda rows, r, spec=spec: self.order_notes(rows, spec)))
+                           validate=self.rows_check(S.T.name, top=n, extra=lambda rows, r, spec=spec: self.order_notes(rows, spec)),
+                           prop=p)
         if len(sortable) >= 2:
             (a, ta), (b, tb) = sortable[0], sortable[1]
             spec = [(a, False, ta), (b, True, tb)]

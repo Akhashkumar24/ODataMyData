@@ -89,6 +89,13 @@ class Client:
 
     def get(self, url, headers=None, auth=True, token=None, max_bytes=20_000_000):
         """GET a path (relative to host) or absolute URL. token overrides the bearer; auth=False sends none."""
+        return self._send("GET", url, headers, auth, token, max_bytes)
+
+    def post(self, url, data, headers=None, max_bytes=20_000_000):
+        """POST with the run's token. Only $batch uses it, and only with GET requests inside."""
+        return self._send("POST", url, headers, True, None, max_bytes, data.encode("utf-8"))
+
+    def _send(self, method, url, headers, auth, token, max_bytes, data=None):
         with self._lock:
             self.count += 1
             if self.count > self.max_requests:
@@ -104,7 +111,8 @@ class Client:
         public = self._swap(url, self.public)
         t0 = time.perf_counter()
         try:
-            r = self.s.get(self._swap(url, self.wire), headers=h, timeout=self.timeout, stream=True, allow_redirects=False)
+            r = self.s.request(method, self._swap(url, self.wire), headers=h, data=data, timeout=self.timeout, stream=True,
+                               allow_redirects=False)
             chunks, size, truncated = [], 0, False
             for c in r.iter_content(65536):
                 size += len(c)

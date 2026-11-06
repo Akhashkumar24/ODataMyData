@@ -61,7 +61,9 @@ def _html(d):
     for r in sorted(d["results"], key=lambda r: (ORDER.index(r["outcome"]), r["set"], r["category"])):
         notes = "<br>".join(f"<b>{e(lvl)}</b> {e(m)}" for lvl, m in r["notes"])
         res_rows.append(
-            f'<tr class="r {r["outcome"]}"><td class="{r["outcome"]}">{r["outcome"]}</td><td>{e(r["set"])}</td><td>{e(r["category"])}</td>'
+            f'<tr class="r {r["outcome"]}{" NEW" if r.get("baseline") == "new" else ""}"><td class="{r["outcome"]}">{r["outcome"]}'
+            + ('<span class="new">NEW</span>' if r.get("baseline") == "new" else "")
+            + f'</td><td>{e(r["set"])}</td><td>{e(r["category"])}</td>'
             f'<td>{e(r["name"])}<div class="url">{e(r["url"])}</div>'
             + (f'<details><summary>curl</summary><code class="url">{e(r.get("curl") or "")}</code></details>' if r.get("curl") else "")
             + (f'<a href="{e(r["response"])}">response</a>' if r.get("response") else "")
@@ -69,6 +71,10 @@ def _html(d):
             f'<td>{"" if r["rows"] is None else r["rows"]}</td><td class="notes">{notes}</td></tr>')
     problems = "".join(f"<li>{e(p)}</li>" for p in d["model"]["problems"]) or "<li>none</li>"
     m = d["meta"]
+    b = m.get("baseline")
+    base_line = (f'<p class="meta">Baseline {e(b["file"])}: <b>{len(b["new"])} new</b>, {len(b["fixed"])} fixed, '
+                 f'{b["still_open"]} known and still open</p>') if b else ""
+    new_btn = '<button data-o="NEW">NEW</button>' if b else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><title>OData test report – {e(m['service'])}</title>
 <style>
 body{{font:14px system-ui,Segoe UI,sans-serif;margin:24px;color:#1b1f24}} h1{{font-size:20px;margin:0}} h2{{font-size:16px;margin-top:28px}}
@@ -78,17 +84,18 @@ table{{border-collapse:collapse;width:100%;margin-top:8px}} td,th{{border-bottom
 th{{background:#f6f8fa;position:sticky;top:0}} .url{{color:#57606a;font:12px ui-monospace,Consolas,monospace;word-break:break-all}}
 .notes{{font-size:12px;max-width:520px}} td.FAIL,.card.FAIL b{{color:#cf222e;font-weight:600}} td.WARN,.card.WARN b{{color:#9a6700;font-weight:600}}
 td.PASS,.card.PASS b{{color:#1a7f37}} td.SKIP,.card.SKIP b{{color:#57606a}}
+.new{{margin-left:6px;padding:0 5px;border-radius:4px;background:#cf222e;color:#fff;font-size:11px}}
 .bar{{margin:12px 0;display:flex;gap:8px;align-items:center}} button{{padding:4px 10px;border:1px solid #d0d7de;border-radius:6px;background:#fff;cursor:pointer}}
 button.on{{background:#1b1f24;color:#fff}} input{{padding:5px 8px;border:1px solid #d0d7de;border-radius:6px;width:320px}}
 </style></head><body>
 <h1>OData test report – {e(m['service'])}</h1>
 <div class="meta">{e(m['started'])} · {m['requests']} requests · {m['duration_s']} s · OData {e(d['model']['version'])}</div>
-{'<p class="meta"><b>Schema inferred from data</b> (no $metadata) – type findings are heuristics.</p>' if m.get('inferred') else ''}{f'<p class="meta">Scope: {e(str(m.get("scope")))}</p>' if m.get('scope') else ''}<div class="cards">{cards}</div>
+{'<p class="meta"><b>Schema inferred from data</b> (no $metadata) – type findings are heuristics.</p>' if m.get('inferred') else ''}{f'<p class="meta">Scope: {e(str(m.get("scope")))}</p>' if m.get('scope') else ''}{base_line}<div class="cards">{cards}</div>
 <h2>Per entity set</h2><table><tr><th>Entity set</th>{''.join(f'<th>{k}</th>' for k in ORDER)}</tr>{set_rows}</table>
 <h2>Model (from $metadata)</h2><table><tr><th>Entity set</th><th>Type</th><th>Keys</th><th>Props</th><th>Navigation → target [FK]</th></tr>{model_rows}</table>
 <h2>Metadata problems</h2><ul>{problems}</ul>
 <h2>Results</h2>
-<div class="bar">{''.join(f'<button data-o="{k}">{k}</button>' for k in ORDER)}<button data-o="" class="on">ALL</button>
+<div class="bar">{''.join(f'<button data-o="{k}">{k}</button>' for k in ORDER)}{new_btn}<button data-o="" class="on">ALL</button>
 <input id="q" placeholder="search name, url, notes…" aria-label="search results"></div>
 <table id="t"><tr><th>Outcome</th><th>Set</th><th>Category</th><th>Test / URL</th><th>HTTP</th><th>ms</th><th>Rows</th><th>Notes</th></tr>{''.join(res_rows)}</table>
 <script>

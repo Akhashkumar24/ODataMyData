@@ -28,9 +28,11 @@ class KeyTests:
         if sel:
             self.check(S.name, "key", f"{seg}?$select={','.join(sel)}", S.name + seg, {"$select": ",".join(sel)},
                        validate=self.entity_check(S.T, select=sel))
-        for nav in S.T.navs.values():
+        for nav in S.T.navs.values() if S.caps.expandable else []:
+            if nav.name in S.caps.non_expandable:
+                continue
             self.check(S.name, "key", f"{seg}?$expand={nav.name}", S.name + seg, {"$expand": nav.name},
-                       validate=lambda r, nav=nav: self.nav_checks(S.T, nav, [self.entity(r) or {}])
+                       validate=lambda r, nav=nav: self.nav_checks(S.T, nav, [self.entity(r) or {}], require=False)
                        + self.entity_check(S.T, row, expand=(nav.name,))(r))
         for p in [p for p in S.scalars if p not in S.T.keys and row.get(p) is not None][:2]:
             t = S.scalars[p][0]
@@ -47,6 +49,9 @@ class KeyTests:
                        optional=True, validate=lambda r, p=p: [] if r.text.strip() == str(row[p]).strip() or t != "Edm.String"
                        else [(WARN, f"$value {r.text[:40]!r} != {row[p]!r}")])
         for nav in S.T.navs.values():
+            if not (S.caps.navigable and S.caps.nav(nav.name).navigable):
+                continue  # NavigationRestrictions: Navigability=None, the path is not offered
+
             def navv(r, nav=nav):
                 if nav.collection:
                     return self.rows_check(nav.type)(r)
@@ -85,7 +90,7 @@ class KeyTests:
             if not seg or d >= self.o.depth:
                 continue
             for nav in T.navs.values():
-                if nav.name in self.m.caps(sname).non_expandable:
+                if nav.name in self.caps(sname).non_expandable:
                     continue
                 r, _ = self.check(S.name, "crawl", f"d{d + 1} {sname}{seg}?$expand={nav.name}", sname + seg, {"$expand": nav.name},
                                   validate=lambda r, nav=nav, T=T: self.nav_checks(T, nav, [self.entity(r) or {}]))
@@ -117,7 +122,7 @@ class KeyTests:
                         continue  # do not crawl further from an entity the service cannot address
                     frontier.append((tset, it, d + 1))
                 pairs, kind = self.m.fk_pairs(T.name, nav)
-                if nav.collection and pairs and self.m.caps(tset).filterable:
+                if nav.collection and pairs and self.caps(tset).filterable:
                     tsc = self.scalars(tT)
                     e = None
                     for sp, tp in pairs:

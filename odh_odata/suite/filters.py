@@ -2,16 +2,30 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from .. import edm
-from .core import pick, Result, Expr, WARN, FAIL
+from .core import pick, Result, Expr, SKIP, WARN, FAIL
+
+# canonical functions that Capabilities.FilterFunctions can list (lambda operators any/all are not functions)
+FUNCTIONS = {"contains", "startswith", "endswith", "substringof", "tolower", "toupper", "length", "indexof", "trim",
+             "concat", "substring", "year", "month", "day", "hour", "minute", "second", "date", "time", "now",
+             "floor", "ceiling", "round", "cast", "isof"}
+_CALL = re.compile(r"\b([a-z]+)\(")
 
 
 class FilterTests:
     def run_filter(self, S, e, must_hit, optional=False, extra=None, exact=None, select=None, label=None):
         if e is None:
             return None
+        used = set(_CALL.findall(e.text)) & FUNCTIONS
+        declared = S.caps.filter_functions
+        if declared is not None:
+            if used - declared:  # the service says it does not support these: a request would only confirm that
+                S.unsupported_fns |= used - declared
+                return None
+            optional = optional and not used  # declared as supported, so a rejection is a defect
         params = {"$filter": e.text, "$top": self.o.sample}
         if S.caps.countable:
             params.update(self.cparam)
@@ -36,6 +50,7 @@ class FilterTests:
                 notes.append((FAIL, f"count {c} < rows returned {len(rows)}"))
             return notes
         r, _ = self.check(S.name, "filter", label or e.text, S.name, params, optional=optional,
+                          prop=next(iter(e.props)) if len(e.props) == 1 else None,
                           validate=self.rows_check(S.T.name, select=select, expand=tuple((extra or {}).get("$expand", "").split(",")) if extra else (),
                                                    top=self.o.sample, extra=v))
         return self.count_of(r) if r is not None and r.status == 200 else None
@@ -67,6 +82,9 @@ class FilterTests:
                              notes=[(WARN, "OData says 'null ne x' is true, but 'ne' omits null rows for: " + ", ".join(S.ne_gaps))]))
         self._structured_filters(S)
         self._nav_filters(S)
+        if S.unsupported_fns:
+            self._add(Result(S.name, "filter", "functions not in Capabilities.FilterFunctions", outcome=SKIP,
+                             notes=[(SKIP, f"not requested, the metadata does not list them: {sorted(S.unsupported_fns)}")]))
 
     def _typed_filters(self, S, p, t, enum, v, vals):
         X, run = self.X, self.run_filter

@@ -11,7 +11,7 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
-from . import metadata, report
+from . import baseline, metadata, replay, report
 from .http import Client, SsmTunnel, clean_token, discover, load_dotenv, token_claims
 from .suite import FAIL, Runner
 
@@ -46,6 +46,8 @@ def build_parser():
     t.add_argument("--thorough", action="store_true",
                    help="exhaustive: every property, every function, every optional URL form (default: focused on high-value tests)")
     t.add_argument("--no-negative", dest="negative", action="store_false", help="skip negative and security tests")
+    t.add_argument("--batch", action="store_true",
+                   help="also test $batch: one POST carrying GETs only (off by default: the run is otherwise GET-only)")
     t.add_argument("--workers", type=int, default=4, help="entity sets tested in parallel")
     t.add_argument("--max-requests", type=int, default=5000, help="hard request budget")
     t.add_argument("--slow-ms", type=int, default=5000, help="WARN above this response time")
@@ -53,7 +55,14 @@ def build_parser():
     o.add_argument("--out", default="runs", help="output folder")
     o.add_argument("--plan", action="store_true", help="only parse metadata and print the model (no tests)")
     o.add_argument("--metadata-file", help="offline: parse this $metadata file (implies --plan)")
-    o.add_argument("--no-capture", dest="capture", action="store_false", help="do not save each response under responses/")
+    o.add_argument("--capture", choices=["failures", "all", "none"], default="failures",
+                   help="responses saved under responses/: only for WARN/FAIL (default; passing responses hold data nobody "
+                        "needs), all (needed for --replay), or none")
+    o.add_argument("--no-capture", dest="capture", action="store_const", const="none", help="same as --capture none")
+    o.add_argument("--baseline", metavar="FILE", help="known-issues file: only findings not in it fail the run (exit 1)")
+    o.add_argument("--update-baseline", action="store_true", help="accept this run's findings into --baseline FILE")
+    o.add_argument("--replay", metavar="RUN_DIR", help="offline: re-judge a run recorded with --capture all, using the "
+                                                       "current code; reports outcomes that changed")
     o.add_argument("--no-metadata", action="store_true", help="ignore $metadata and infer the schema from the target's data")
     o.add_argument("-v", "--verbose", action="store_true", help="print every test, not only WARN/FAIL")
     return ap
@@ -69,7 +78,8 @@ def print_plan(model, root=None):
         for n, x in e["navigation"].items():
             fk = f"  FK {x['fk_kind']}: {', '.join(x['fk'])}" if x["fk"] else "  FK unknown"
             print(f"    -> {n} ({'many' if x['collection'] else 'one'} {x['type']}) => {x['target_set'] or 'unbound'}{fk}")
-        restricted = {k: v for k, v in e["capabilities"].items() if v not in (True, [], False) or k in ("countable", "filterable") and v is False}
+        default = metadata.Caps().json()
+        restricted = {k: v for k, v in e["capabilities"].items() if v != default[k]}
         if restricted:
             print(f"    capabilities: {restricted}")
     for op in s["operations"]:
@@ -99,6 +109,10 @@ def diagnose(client, token, hint):
 def main(argv=None):
     load_dotenv()
     a = build_parser().parse_args(argv)
+    if a.update_baseline and not a.baseline:
+        sys.exit("--update-baseline needs --baseline FILE")
+    if a.replay:
+        return replay.run(a.replay, a)[0]
     if a.metadata_file:
         print_plan(metadata.parse(Path(a.metadata_file).read_bytes()))
         return 0
@@ -151,21 +165,37 @@ def main(argv=None):
         out = Path(a.out) / f"{slug}-{datetime.now():%Y%m%d-%H%M%S}"
         out.mkdir(parents=True, exist_ok=True)
         (out / ("metadata.inferred.xml" if model.inferred else "metadata.xml")).write_text(xml, encoding="utf-8")
-        cap = out / "responses" if a.capture else None
+        cap = out / "responses" if a.capture != "none" else None
         if cap:
             cap.mkdir()
         print(f"\nrunning tests on {only or 'all entity sets'} -> {out}\n")
-        t0 = time.time()
+        t0, started = time.time(), datetime.now().isoformat(timespec="seconds")
         client.stop_on_401 = True
         runner = Runner(client, model, root, a, base_filters=scope, capture_dir=cap)
         results = runner.run(only)
-        meta = {"service": f"{base}/{root}", "inferred": model.inferred, "scope": scope, "started": datetime.now().isoformat(timespec="seconds"),
-                "duration_s": round(time.time() - t0, 1), "requests": client.count, "only": only,
-                "options": {k: v for k, v in vars(a).items() if k != "token"}}
+        opts = {k: v for k, v in vars(a).items() if k != "token"}
+        opts["header"] = [h.partition(":")[0] + ": ***" for h in a.header]  # header values may be secrets
+        meta = {"service": f"{base}/{root}", "inferred": model.inferred, "scope": scope, "started": started,
+                "duration_s": round(time.time() - t0, 1), "requests": client.count, "only": only, "options": opts}
+        failed = any(r.outcome == FAIL for r in results)
+        if a.baseline:
+            new, fixed, still = baseline.compare(results, baseline.load(a.baseline))
+            baseline.mark(results, new)
+            meta["baseline"] = {"file": a.baseline, "new": new, "fixed": fixed, "still_open": len(still)}
+            failed = any(o == FAIL for o in new.values())
         report.console(results)
+        if a.baseline:
+            print(f"\nbaseline {a.baseline}: {len(new)} new, {len(fixed)} fixed, {len(still)} known and still open")
+            for k, o in sorted(new.items()):
+                print(f"  NEW {o:<4} {k}")
+            for k in sorted(fixed):
+                print(f"  FIXED     {k}")
+            if a.update_baseline:
+                print(f"baseline updated: {baseline.save(a.baseline, results, meta['service'])} accepted findings")
+                failed = False
         j, h = report.write(out, results, model, meta)
         print(f"\n{client.count} requests in {meta['duration_s']} s\nreport: {h}\n        {j}")
-        return 1 if any(r.outcome == FAIL for r in results) else 0
+        return 1 if failed else 0
 
 
 if __name__ == "__main__":

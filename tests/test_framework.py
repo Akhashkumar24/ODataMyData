@@ -1,11 +1,15 @@
 """Offline self-checks: python -m unittest discover -s tests"""
+import re
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import unquote
 
-from odh_odata import edm, metadata
+from odh_odata import baseline, edm, metadata
 from odh_odata.http import Client, Resp, TokenExpired, candidates
-from odh_odata.suite import FAIL, PASS, SKIP, WARN, Exprs, Runner
+from odh_odata.suite import FAIL, PASS, SKIP, WARN, Exprs, Result, Runner
+from tests.stub import StubService
 
 V4 = """<?xml version="1.0" encoding="utf-8"?>
 <edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
@@ -264,7 +268,7 @@ class ClientTests(unittest.TestCase):
             def iter_content(self, n): return [b""]
             def close(self): pass
         c = Client("https://h", "tok")
-        c.s.get = lambda *a, **k: R()
+        c.s.request = lambda *a, **k: R()
         self.assertEqual(c.get("x").status, 401)  # not armed yet (discovery phase)
         c.stop_on_401 = True
         self.assertEqual(c.get("x").status, 401)
@@ -282,22 +286,140 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("api/v1.0/odata/AircraftSensors", names)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class EndToEndTests(unittest.TestCase):
     """The whole Runner against a stub that ignores every query option: every step runs, nothing crashes,
     and each category catches the misbehaviour it exists for."""
 
-    def run_stub(self, **kw):
-        from odh_odata.__main__ import build_parser
-        from tests.stub import StubService
-        opts = vars(build_parser().parse_args(["x"]))
-        opts.update(workers=1, verbose=False)
+    def run_stub(self, xml=V4, capture_dir=None, opts=None, **kw):
         stub = StubService(**kw)
-        r = Runner(stub, metadata.parse(V4), "", SimpleNamespace(**opts), log=lambda *_: None)
+        r = Runner(stub, metadata.parse(xml), "", SimpleNamespace(**{**stub_opts(), **(opts or {})}), log=lambda *_: None,
+                   capture_dir=capture_dir)
         return stub, r.run()
+
+    def test_top_not_sent_where_top_unsupported(self):
+        _, results = self.run_stub()  # V4 declares TopSupported=false on Aircraft
+        sent = [x for x in results if x.set == "Aircraft" and x.category not in ("negative", "security")
+                and re.search(r"/Aircraft\?(.*&)?\$top=", x.url)]
+        self.assertEqual([x.name for x in sent], [])
+        self.assertFalse(any("rows for $top" in m for x in results if x.set == "Aircraft" for _, m in x.notes))
+
+    def test_nested_expand_without_the_navigation_fails(self):
+        _, results = self.run_stub()
+        nested = [x for x in results if x.name == "$expand=Sensors($top=2)"]
+        self.assertEqual([x.outcome for x in nested], [FAIL])
+
+    def test_repeated_500_on_a_property_stops_requests_on_it(self):
+        _, results = self.run_stub(fail_500="Tail")
+        errs = [x for x in results if x.set == "Aircraft" and any("involving property 'Tail'" in m for _, m in x.notes)]
+        skipped = [x for x in results if x.set == "Aircraft" and x.outcome == SKIP and "'Tail' already caused" in x.notes[0][1]]
+        self.assertEqual(len(errs), Runner.BREAK_5XX)
+        self.assertTrue(skipped)
+
+    def test_filter_functions_declared_limits_function_tests(self):
+        xml = V4.replace("<FunctionImport", '<Annotation Term="Capabilities.FilterFunctions"><Collection>'
+                         "<String>contains</String></Collection></Annotation><FunctionImport", 1)
+        stub, results = self.run_stub(xml)
+        self.assertFalse([u for u in stub.urls if re.search(r"(startswith|endswith|tolower|year)\(", unquote(u))])
+        self.assertTrue([u for u in stub.urls if "contains(" in unquote(u)])
+        skip = [x for x in results if x.name == "functions not in Capabilities.FilterFunctions"]
+        self.assertTrue(skip and "startswith" in skip[0].notes[0][1])
+
+    def test_batch_matches_direct_requests(self):
+        stub, results = self.run_stub(opts={"batch": True})
+        b = [x for x in results if x.category == "batch" and x.name.startswith("$batch")]
+        self.assertEqual([(x.outcome, x.notes) for x in b], [(PASS, [])])
+        _, off = self.run_stub()
+        self.assertFalse([x for x in off if x.category == "batch"])  # opt-in only
+
+    def test_replay_reproduces_a_recorded_run(self):
+        from odh_odata import replay, report
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / "responses").mkdir()
+            (run / "metadata.xml").write_text(V4, encoding="utf-8")
+            opts = {**stub_opts(), "capture": "all", "batch": True}
+            _, results = self.run_stub(capture_dir=run / "responses", opts=opts)
+            report.write(run, results, metadata.parse(V4), {"service": "http://h", "inferred": False, "scope": {},
+                                                             "started": "", "duration_s": 0, "requests": 0, "only": None,
+                                                             "options": opts})
+            log = []
+            code, again = replay.run(run, SimpleNamespace(**stub_opts()), log=log.append)
+        self.assertEqual(code, 0, log)
+        self.assertIn("0 not in the recording", log[0])
+        self.assertEqual([(baseline.test_id(x), x.outcome) for x in again], [(baseline.test_id(x), x.outcome) for x in results])
+
+
+def stub_opts():
+    from odh_odata.__main__ import build_parser
+    return {**vars(build_parser().parse_args(["x"])), "workers": 1, "verbose": False}
+
+
+class CapabilityTests(unittest.TestCase):
+    def test_container_set_and_navigation_annotations(self):
+        xml = V4.replace("<FunctionImport", '<Annotation Term="Capabilities.BatchSupported" Bool="false"/><FunctionImport', 1)
+        xml = xml.replace("</Annotations>", """</Annotations>
+   <Annotations Target="self.Container/Aircraft/Sensors">
+    <Annotation Term="Capabilities.CountRestrictions"><Record><PropertyValue Property="Countable" Bool="false"/></Record></Annotation>
+   </Annotations>
+   <Annotations Target="self.Container/Sensors">
+    <Annotation Term="Capabilities.ExpandRestrictions"><Record><PropertyValue Property="MaxLevels" Int="1"/></Record></Annotation>
+    <Annotation Term="Capabilities.NavigationRestrictions"><Record><PropertyValue Property="RestrictedProperties"><Collection>
+     <Record><PropertyValue Property="NavigationProperty" NavigationPropertyPath="Aircraft"/>
+      <PropertyValue Property="Navigability" EnumMember="Capabilities.NavigationType/None"/>
+      <PropertyValue Property="TopSupported" Bool="false"/></Record></Collection></PropertyValue></Record></Annotation>
+   </Annotations>""", 1)
+        m = metadata.parse(xml)
+        a, s = m.caps("Aircraft"), m.caps("Sensors")
+        self.assertFalse(a.batch)  # container-level term reaches every set
+        self.assertFalse(a.nav("Sensors").countable)  # Container/Set/Nav target
+        self.assertTrue(a.nav("Sensors").top)
+        self.assertEqual(s.max_levels, 1)
+        self.assertFalse(s.nav("Aircraft").navigable)
+        self.assertFalse(s.nav("Aircraft").top)
+        self.assertIsNone(s.filter_functions)
+        self.assertEqual(m.summary()["entity_sets"]["Sensors"]["capabilities"]["navs"]["Aircraft"]["navigable"], False)
+
+
+class ReplayTests(unittest.TestCase):
+    def test_old_windows_text_mode_capture_is_read(self):
+        from odh_odata.replay import load_capture
+        text = ("# S | read | list\ncurl -sk 'https://h/svc/S?$top=1' -H 'Accept: application/json' -H \"Authorization: Bearer "
+                "$ODATA_TOKEN\"\n\nHTTP 200 (12 ms)\nContent-Type: application/json\n\n{\"value\": [{\"A\": 1.50}]}").replace("\n", "\r\n")
+        key, r = load_capture(text)
+        self.assertEqual(key, ("GET", "https://h/svc/S?$top=1", "token"))
+        self.assertEqual((r.status, r.ms, str(r.json["value"][0]["A"])), (200, 12, "1.50"))  # Decimal kept exactly
+
+
+class BaselineTests(unittest.TestCase):
+    def R(self, name, outcome, set_="S", cat="filter"):
+        return Result(set_, cat, name, outcome=outcome)
+
+    def test_test_id_masks_sampled_values_only(self):
+        a = baseline.test_id(self.R("Code eq 'A1' and Start ge 2026-01-02T03:04:05Z and Address2 lt 15", FAIL))
+        b = baseline.test_id(self.R("Code eq 'B''x' and Start ge 2025-12-31T00:00:00Z and Address2 lt 7", FAIL))
+        self.assertEqual(a, b)
+        self.assertIn("Address2", a)
+        self.assertNotEqual(a, baseline.test_id(self.R("Other eq 'A1'", FAIL)))
+
+    def test_compare_new_fixed_and_known(self):
+        known = {"S | filter | A eq '~'": FAIL, "S | filter | B eq '~'": WARN, "S | filter | C eq '~'": FAIL,
+                 "T | key | gone": FAIL}
+        now = [self.R("A eq 'x'", FAIL), self.R("B eq 'x'", FAIL), self.R("C eq 'x'", PASS), self.R("D eq 'x'", WARN)]
+        new, fixed, still = baseline.compare(now, known)
+        self.assertEqual(new, {"S | filter | B eq '~'": FAIL, "S | filter | D eq '~'": WARN})  # WARN->FAIL counts as new
+        self.assertEqual(fixed, {"S | filter | C eq '~'": FAIL})  # T|key|gone did not run: not claimed as fixed
+        self.assertEqual(still, {"S | filter | A eq '~'": FAIL})
+
+    def test_save_keeps_entries_for_tests_that_did_not_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "b.json"
+            baseline.save(p, [self.R("A eq 'x'", FAIL, set_="S"), self.R("B", FAIL, set_="T")], "svc")
+            baseline.save(p, [self.R("A eq 'x'", PASS, set_="S")], "svc")  # e.g. a later --only S run
+            self.assertEqual(baseline.load(p), {"T | filter | B": FAIL})
+
+
+if __name__ == "__main__":
+    unittest.main()
 
     def test_ignoring_service_is_caught_everywhere(self):
         stub, results = self.run_stub()

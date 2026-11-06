@@ -143,6 +143,53 @@ class Caps:
     non_sortable: set = field(default_factory=set)
     non_expandable: set = field(default_factory=set)
     required_filter: set = field(default_factory=set)
+    filter_functions: set | None = None  # None = not declared (anything may work); else the only functions supported
+    max_levels: int | None = None  # ExpandRestrictions/MaxLevels; None = unlimited
+    batch: bool = True
+    navigable: bool = True
+    navs: dict = field(default_factory=dict)  # nav name -> Caps for queries through that navigation
+
+    def nav(self, name):
+        return self.navs.get(name) or Caps()
+
+    def json(self):
+        return {k: ({n: c.json() for n, c in v.items()} if k == "navs" else sorted(v) if isinstance(v, set) else v)
+                for k, v in vars(self).items()}
+
+
+def _caps(get):
+    """Build Caps from a term lookup: get('FilterRestrictions') -> value. Works for set annotations and for
+    NavigationRestrictions/RestrictedProperties records, which use the same term names as property names."""
+    c = Caps()
+
+    def rec(term):
+        v = get(term)
+        return v if isinstance(v, dict) else {}
+
+    def paths(v):
+        return {str(x) for x in v} if isinstance(v, list) else set()
+
+    c.countable = rec("CountRestrictions").get("Countable", True) is not False
+    f = rec("FilterRestrictions")
+    c.filterable = f.get("Filterable", True) is not False
+    c.requires_filter = f.get("RequiresFilter") is True
+    c.non_filterable = paths(f.get("NonFilterableProperties"))
+    c.required_filter = paths(f.get("RequiredProperties"))
+    s = rec("SortRestrictions")
+    c.sortable = s.get("Sortable", True) is not False
+    c.non_sortable = paths(s.get("NonSortableProperties"))
+    e = rec("ExpandRestrictions")
+    c.expandable = e.get("Expandable", True) is not False
+    c.non_expandable = paths(e.get("NonExpandableProperties"))
+    ml = e.get("MaxLevels")
+    c.max_levels = ml if isinstance(ml, int) and ml >= 0 else None
+    c.top = get("TopSupported") is not False
+    c.skip = get("SkipSupported") is not False
+    c.searchable = rec("SearchRestrictions").get("Searchable") is True
+    ff = get("FilterFunctions")
+    c.filter_functions = {str(x).strip().lower() for x in ff} if isinstance(ff, list) else None
+    c.batch = get("BatchSupported") is not False
+    return c
 
 
 @dataclass
@@ -156,9 +203,10 @@ class Model:
     operations: list
     imports: list
     container: str | None
-    set_annotations: dict
+    set_annotations: dict  # set -> {term: value}; "$nav" -> {nav: {term: value}} from Container/Set/Nav targets
     problems: list = field(default_factory=list)
     inferred: bool = False  # True when built from sample data because $metadata was unavailable
+    container_annotations: dict = field(default_factory=dict)  # apply to every set unless the set overrides them
 
     @property
     def v4(self):
@@ -193,31 +241,19 @@ class Model:
         return (t, None) if t.startswith("Edm.") else None
 
     def caps(self, set_name):
-        a = self.set_annotations.get(set_name, {})
-        c = Caps()
-
-        def rec(term):
-            v = a.get(CAP + term)
-            return v if isinstance(v, dict) else {}
-
-        def paths(v):
-            return {str(x) for x in v} if isinstance(v, list) else set()
-
-        c.countable = rec("CountRestrictions").get("Countable", True) is not False
-        f = rec("FilterRestrictions")
-        c.filterable = f.get("Filterable", True) is not False
-        c.requires_filter = f.get("RequiresFilter") is True
-        c.non_filterable = paths(f.get("NonFilterableProperties"))
-        c.required_filter = paths(f.get("RequiredProperties"))
-        s = rec("SortRestrictions")
-        c.sortable = s.get("Sortable", True) is not False
-        c.non_sortable = paths(s.get("NonSortableProperties"))
-        e = rec("ExpandRestrictions")
-        c.expandable = e.get("Expandable", True) is not False
-        c.non_expandable = paths(e.get("NonExpandableProperties"))
-        c.top = a.get(CAP + "TopSupported", True) is not False
-        c.skip = a.get(CAP + "SkipSupported", True) is not False
-        c.searchable = rec("SearchRestrictions").get("Searchable") is True
+        own = self.set_annotations.get(set_name, {})
+        a = {**self.container_annotations, **own}
+        c = _caps(lambda t: a.get(CAP + t))
+        nr = a.get(CAP + "NavigationRestrictions")
+        nr = nr if isinstance(nr, dict) else {}
+        c.navigable = not str(nr.get("Navigability") or "").endswith("None")
+        for rp in nr.get("RestrictedProperties") or []:
+            if isinstance(rp, dict) and rp.get("NavigationProperty"):
+                sub = _caps(rp.get)
+                sub.navigable = not str(rp.get("Navigability") or "").endswith("None")
+                c.navs[str(rp["NavigationProperty"]).rsplit("/", 1)[-1]] = sub
+        for nav, annos in (own.get("$nav") or {}).items():  # Container/Set/Nav targets
+            c.navs[nav] = _caps(lambda t, annos=annos: annos.get(CAP + t))
         return c
 
     def fk_pairs(self, src_qn, nav):
@@ -272,7 +308,7 @@ class Model:
                 "properties": {p.name: (f"Collection({p.type})" if p.collection else p.type) + ("" if p.nullable else " NOT NULL")
                                for p in T.properties.values()},
                 "navigation": navs,
-                "capabilities": {k: (sorted(v) if isinstance(v, set) else v) for k, v in vars(caps).items()},
+                "capabilities": caps.json(),
             }
         for o in self.operations:
             out["operations"].append({"name": o.name, "kind": o.kind, "bound": o.bound,
@@ -402,11 +438,12 @@ class _Parser:
             raw[tqn].navs[nname].v2rel = (rel, frm, to)
 
         types = _flatten(raw)
-        sets, imports, set_annos, cname = {}, [], {}, None
+        sets, imports, set_annos, cname, cont_annos = {}, [], {}, None, {}
         for ns, c in containers:
             if cname and not _bool(_attr(c, "IsDefaultEntityContainer"), False):
                 continue  # v2 may declare several containers; prefer the default one
             cname = f"{ns}.{c.get('Name')}"
+            cont_annos = self._annos(c)
             assoc_sets = []
             for el in c:
                 tag, name = _l(el.tag), el.get("Name")
@@ -444,14 +481,18 @@ class _Parser:
         cshort = cname.rsplit(".", 1)[-1] if cname else None
         for s in self.schemas:
             for a in _kids(s, "Annotations"):
-                tgt = a.get("Target") or ""
-                if "/" not in tgt:
+                parts = (a.get("Target") or "").split("/")
+                if self.qn(parts[0]) not in (cname, cshort):
                     continue
-                cont, rest = tgt.split("/", 1)
-                if "/" not in rest and self.qn(cont) in (cname, cshort):
-                    set_annos.setdefault(rest, {}).update(self._annos(a))
+                if len(parts) == 1:
+                    cont_annos.update(self._annos(a))
+                elif len(parts) == 2:
+                    set_annos.setdefault(parts[1], {}).update(self._annos(a))
+                elif len(parts) == 3:
+                    set_annos.setdefault(parts[1], {}).setdefault("$nav", {}).setdefault(parts[2], {}).update(self._annos(a))
 
-        m = Model(version, dict(self.alias), types, enums, tdefs, sets, ops, imports, cname, set_annos)
+        m = Model(version, dict(self.alias), types, enums, tdefs, sets, ops, imports, cname, set_annos,
+                  container_annotations=cont_annos)
         _lint(m)
         return m
 
@@ -607,8 +648,11 @@ def infer_xml(set_name, rows, ns="Inferred"):
             f'<EntitySet Name={quoteattr(set_name)} EntityType="{ns}.{tname}"/></EntityContainer></Schema></edmx:DataServices></edmx:Edmx>')
 
 
-def infer_model(set_name, rows):
-    m = parse(infer_xml(set_name, rows))
+def as_inferred(m):
     m.inferred = True
     m.problems = [p for p in m.problems if "has no key" not in p]  # missing key is a guess failure, not a service defect
     return m
+
+
+def infer_model(set_name, rows):
+    return as_inferred(parse(infer_xml(set_name, rows)))

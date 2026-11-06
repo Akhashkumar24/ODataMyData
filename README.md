@@ -5,11 +5,12 @@ entity set, property, navigation link and function, runs them with real sample d
 related entities. The results go into an HTML and a JSON report. Nothing about a particular service is
 hard-coded: everything comes from the metadata and the live data.
 
-It only sends GET requests. It never sends POST, PATCH or DELETE, and it never invokes actions.
+It only sends GET requests. It never sends PATCH or DELETE and never invokes actions. The one exception is
+the opt-in `--batch` test: a single POST to `$batch` that carries only GET requests.
 
 ## Setup
 
-- **Software:** Python 3.11+ and `requests` (`pip install requests`). The automatic tunnel also needs
+- **Software:** Python 3.11+ and `pip install -r requirements.txt`. The automatic tunnel also needs
   AWS CLI v2 and the Session Manager plugin.
 - **Token:** put your bearer token in `.env`, next to this README:
   ```
@@ -52,9 +53,11 @@ If you already have a tunnel open on `localhost:8443`, use `--connect localhost:
 4. **Your `$filter` is a scope.** A `$filter` in the target URL is AND-ed into every collection query on
    that set (`$count` included). This is how endpoints that require a filter get tested, e.g.
    `.../AircraftSensor?$filter=AircraftFleetTypeCode eq 'FWD Cabin'`.
-5. **Every request is saved.** Each result keeps a reproducible `curl` (the token is written as
-   `$ODATA_TOKEN`), and its full response goes to `runs/<run>/responses/NNNNN.txt`. Both are linked
-   from `report.html`. Use `--no-capture` to turn this off.
+5. **Evidence for every finding.** Each result keeps a reproducible `curl` (the token is written as
+   `$ODATA_TOKEN`). The full response of every WARN and FAIL goes to `runs/<run>/responses/NNNNN.txt`,
+   linked from `report.html`. Passing responses are not saved by default, because they hold real data
+   (for example employee records) that nobody needs to read. `--capture all` saves every response, which
+   `--replay` needs. `--capture none` saves nothing.
 6. **Diagnosis.** If nothing is found, it prints the token's audience and number of roles. If the gateway
    also returns 404 without a token, it points out that 404 can mean a missing app role, not a missing API.
 7. **Token expiry or rejection.** If the token expires mid-run, or the server starts answering 401 to it, the
@@ -100,12 +103,49 @@ the default for day-to-day checks.
 | `--no-negative` | | skip the negative and security tests |
 | `--workers N` | 4 | number of entity sets tested in parallel |
 | `--max-requests N` | 5000 | hard limit on requests per run |
+| `--batch` | | also test `$batch` (a POST carrying only GETs) |
+| `--capture failures\|all\|none` | failures | which responses are saved under `responses/` |
+| `--baseline FILE` | | known-issues file: only findings that are not in it fail the run |
+| `--update-baseline` | | accept this run's findings into the `--baseline` file |
+| `--replay RUN_DIR` | | offline: re-judge a run recorded with `--capture all` using the current code |
 | `-v` | | print every test, not only WARN and FAIL |
 
 Every option can also come from `.env`: `ODATA_URL`, `ODATA_BASE_URL`, `ODATA_CONNECT`, `ODATA_SSM_TARGET`,
 `ODATA_SSM_PROFILE`, `ODATA_SSM_REGION`, `ODATA_LOCAL_PORT`.
 
-The exit code is `1` if any test fails, so you can use it in CI.
+The exit code is `1` if any test fails. With `--baseline` it is `1` only for new FAILs (see below).
+
+### Baseline: fail on regressions, not on known defects
+
+A service with known defects fails every run, so a red build stops meaning anything. A baseline file
+records the accepted findings:
+
+```powershell
+python -m odh_odata <url> --baseline baselines/flight.json --update-baseline   # once: accept today's findings
+python -m odh_odata <url> --baseline baselines/flight.json                     # every run after that
+```
+
+Each run then prints, and marks in `report.html` (the **NEW** filter):
+- **new**: a WARN or FAIL that is not in the baseline, or a WARN that became a FAIL. Only a new FAIL sets exit code 1.
+- **fixed**: a baseline finding whose test ran and now passes. Remove it with `--update-baseline`.
+- **known**: still open, accepted.
+
+Findings are matched by entity set, category and test name, with the sampled values masked, so
+`Status eq 'Active'` today and `Status eq 'Retired'` tomorrow count as the same test. `--update-baseline`
+keeps entries for sets that did not run, so `--only` runs don't drop them. Commit the baseline file: it
+holds test names and outcomes only, no response data.
+
+### Replay: change the framework without the tunnel
+
+```powershell
+python -m odh_odata <url> --capture all                       # record once
+python -m odh_odata --replay runs/api-v1-0-20261106-003304    # after every code change, offline
+```
+
+The replay serves every request from the recording, runs the current code and lists the outcomes that
+changed. Use it to check that a new validator or test generator does what you expect against real
+service behaviour. Exit code `1` means something changed. Runs recorded before this version can't be
+replayed reliably: their responses were re-serialised and cut at 256 KB.
 
 ## What gets tested
 
@@ -123,7 +163,30 @@ The exit code is `1` if any test fails, so you can use it in CI.
 | `$expand` | Each navigation property, nested `$top` `$orderby` `$count` `$filter` `$select`, two-level `$expand`, all navigations at once, `*`, and `$ref`. Expanded data must satisfy the referential constraints. |
 | Keys | Get by key for several rows, compared with the copy from the list. Named-key and key-as-segment forms. `$select` and `$expand` on a single entity. Property access, `/$value`, navigation paths, a non-existent key (must be 404), and malformed keys. |
 | Crawl | Starting from sampled rows, expand each navigation, then resolve every related entity in its own entity set, down to depth N. A related entity that can't be fetched by key is flagged as dangling. Reverse foreign-key filters must return the same children as `$expand`. |
+| `$batch` (`--batch`) | Up to three sets in one multipart batch, plus one invalid request. Each answer inside must match the same GET sent alone, and the invalid one must fail on its own (404) without failing the batch. |
 | Negative and security | Unknown properties, malformed expressions, bad `$top`/`$skip`, type mismatches, unknown system options. A quote-escaping (injection) probe. No token, an invalid token, and a token with a tampered signature. |
+
+### Capability annotations it follows
+
+The test plan comes from the `Org.OData.Capabilities.V1` annotations, whether they are inline, on
+`Container/Set`, on `Container/Set/Navigation`, or on the container itself (which applies to every set):
+
+| Annotation | Effect |
+|---|---|
+| `CountRestrictions`, `FilterRestrictions`, `SortRestrictions`, `ExpandRestrictions` | Restricted options and properties are not tested as if they should work. `Countable=false` expects `$count` to be rejected. |
+| `FilterRestrictions/RequiresFilter` | Without a `$filter` in the URL: one "unfiltered list is rejected" check and a SKIP, not dozens of 400s. |
+| `FilterFunctions` | Only the listed functions are tested, and they must work (no "optional" leniency). The others are listed in one SKIP. |
+| `TopSupported=false` | `$top` is never sent to that set, and row limits are not checked. |
+| `ExpandRestrictions/MaxLevels` | No two-level `$expand` when it is 1. |
+| `NavigationRestrictions` (`Navigability`, per-navigation `TopSupported`, `CountRestrictions`, …) | Navigation paths that are not offered are not requested. Nested `$expand` options follow the navigation's own restrictions. |
+| `SearchRestrictions/Searchable` | `$search` is tested only where declared. |
+| `BatchSupported=false` | `--batch` is skipped. |
+
+### Server errors are grouped by cause
+
+A 5xx on a request that tests one property is reported as `server error 500 involving property 'X'`, so
+the console's top findings read as one line per broken property. After 3 server errors on one property,
+the remaining tests on it are skipped: the defect is already proven, and more requests only add noise.
 
 Foreign keys come from the metadata's referential constraints. Where the metadata doesn't declare them, the
 tool infers them from naming conventions, e.g. `CurrentEmployeePersonalNumber` → `Employee.PersonalNumber`.
@@ -146,9 +209,22 @@ The reports contain URLs and sample key values. Treat them as internal data.
 ## Self-test
 
 ```
-python -m unittest tests/test_framework.py
+python -m unittest discover -s tests
 ```
 
-This runs offline. It covers the parser (v2 and v4, inheritance, aliases, enums, type definitions,
-annotations, functions, linting), literals, value checks, local filter evaluation, sort checks and
-discovery.
+This runs offline in a few seconds. It covers the parser (v2 and v4, inheritance, aliases, enums, type
+definitions, capability annotations at every target level, functions, linting), literals, value checks,
+local filter evaluation, sort checks, discovery, the baseline, and replay. `tests/stub.py` is an in-memory
+service that ignores every query option. The end-to-end tests run the whole suite against it and check that
+every test category notices, and that a recorded run replays with identical outcomes.
+
+## Code layout
+
+| Module | Role |
+|---|---|
+| `metadata.py` | CSDL parser (v2/v3/v4), capability model, metadata lint, schema inference |
+| `edm.py` | Edm type checks, URL literals, Python conversions |
+| `http.py` | Client (SSM tunnel, SNI), token handling, service discovery |
+| `suite/runner.py` | Request plumbing, judging, validators, orchestration |
+| `suite/{service,read,expand,filters,keys,negative,batch}.py` | One test family each |
+| `baseline.py`, `replay.py`, `report.py` | Known-issue gating, offline replay, console/JSON/HTML reports |
