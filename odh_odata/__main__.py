@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import baseline, metadata, replay, report
-from .http import Client, SsmTunnel, clean_token, discover, load_dotenv, token_claims
+from .http import Client, SsmTunnel, clean_token, discover, fetch_token, load_dotenv, token_claims
 from .suite import FAIL, Runner
 
 
@@ -26,6 +26,12 @@ def build_parser():
                     help="full URL (https://host/api/v1.0/odata/Vehicle/Vehicles), a path, or a service name (AircraftSensor)")
     ap.add_argument("--base", default=env("ODATA_BASE_URL"), help="https://host, needed when target is a path or name")
     ap.add_argument("--token", default=env("ODATA_TOKEN"), help="bearer token (default: ODATA_TOKEN from env or .env)")
+    au = ap.add_argument_group("token request (used when no valid ODATA_TOKEN is given; also renews it during long runs)")
+    au.add_argument("--token-url", default=env("ODATA_TOKEN_URL"), help="OAuth2 token endpoint")
+    au.add_argument("--client-id", default=env("ODATA_CLIENT_ID"))
+    au.add_argument("--client-secret", default=env("ODATA_CLIENT_SECRET"), help="prefer .env over the command line")
+    au.add_argument("--scope", default=env("ODATA_SCOPE"))
+    au.add_argument("--grant-type", default=env("ODATA_GRANT_TYPE", "client_credentials"))
     ap.add_argument("-H", "--header", action="append", default=[], metavar="NAME: VALUE",
                     help="extra header for every request (repeatable), e.g. -H 'X-Correlation-ID: abc'")
     ap.add_argument("--only", nargs="*", help="entity sets to test (default: all, or the one named in the URL)")
@@ -127,12 +133,22 @@ def main(argv=None):
         hint, _, query = a.target.partition("?")
         base = a.base.rstrip("/")
     token = clean_token(a.token)
-    if not token:
-        sys.exit("no bearer token: set ODATA_TOKEN in the environment or .env, or pass --token")
     exp = token_claims(token).get("exp")
+    refresh = None
+    if a.token_url and a.client_id and a.client_secret:
+        refresh = lambda: fetch_token(a.token_url, a.client_id, a.client_secret, a.scope, a.grant_type)
+        if not token or (exp and exp < time.time() + 60):
+            try:
+                token = refresh()
+            except RuntimeError as e:
+                sys.exit(str(e))
+            exp = token_claims(token).get("exp")
+            print(f"token: requested from {urllib.parse.urlsplit(a.token_url).netloc}" + (f", valid {int((exp - time.time()) / 60)} min" if exp else ""))
+    if not token:
+        sys.exit("no bearer token: set ODATA_TOKEN, or ODATA_TOKEN_URL + ODATA_CLIENT_ID + ODATA_CLIENT_SECRET (+ ODATA_SCOPE) in .env")
     if exp and exp < time.time():
         sys.exit(f"bearer token expired at {datetime.fromtimestamp(exp)} - get a fresh one")
-    if exp and exp - time.time() < 600:
+    if exp and exp - time.time() < 600 and not refresh:
         print(f"WARNING: token expires in {int((exp - time.time()) / 60)} min")
 
     host = urllib.parse.urlsplit(base).hostname
@@ -142,6 +158,7 @@ def main(argv=None):
     with tunnel:
         hdrs = dict((k.strip(), v.strip()) for k, _, v in (h.partition(":") for h in a.header) if k.strip())
         client = Client(base, token, connect, a.verify, a.timeout, a.max_requests, hdrs)
+        client.refresh = refresh
         print(f"target {base}{'/' + hint.strip('/') if hint.strip('/') else ''}" + (f"  (via {connect})" if connect else ""))
         try:
             root, xml, model, set_hint, tried = discover(client, hint, query=query, infer=a.no_metadata)
@@ -173,7 +190,7 @@ def main(argv=None):
         client.stop_on_401 = True
         runner = Runner(client, model, root, a, base_filters=scope, capture_dir=cap)
         results = runner.run(only)
-        opts = {k: v for k, v in vars(a).items() if k != "token"}
+        opts = {k: v for k, v in vars(a).items() if k not in ("token", "client_secret")}
         opts["header"] = [h.partition(":")[0] + ": ***" for h in a.header]  # header values may be secrets
         meta = {"service": f"{base}/{root}", "inferred": model.inferred, "scope": scope, "started": started,
                 "duration_s": round(time.time() - t0, 1), "requests": client.count, "only": only, "options": opts}

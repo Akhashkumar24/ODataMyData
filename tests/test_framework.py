@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from urllib.parse import unquote
 
 from odh_odata import baseline, edm, metadata
-from odh_odata.http import Client, Resp, TokenExpired, candidates
+from odh_odata.http import Client, Resp, TokenExpired, candidates, fetch_token
 from odh_odata.suite import FAIL, PASS, SKIP, WARN, Exprs, Result, Runner
 from tests.stub import StubService
 
@@ -275,6 +275,50 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(c.get("x", auth=False).status, 401)  # unauthenticated probes still run
         with self.assertRaises(TokenExpired):
             c.get("x")
+
+
+def jwt(exp):
+    import base64
+    import json
+    b = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return f"{b({'alg': 'none'})}.{b({'exp': exp})}.sig"
+
+
+class TokenRequestTests(unittest.TestCase):
+    def test_fetch_token_posts_the_form_and_hides_the_secret_on_error(self):
+        import requests
+        from unittest import mock
+        ok = SimpleNamespace(status_code=200, text="", json=lambda: {"access_token": "T"})
+        with mock.patch.object(requests, "post", return_value=ok) as post:
+            self.assertEqual(fetch_token("https://login/x", "id", "SECRET", "api://a/.default"), "T")
+        self.assertEqual(post.call_args.kwargs["data"], {"client_id": "id", "client_secret": "SECRET",
+                                                          "grant_type": "client_credentials", "scope": "api://a/.default"})
+        bad = SimpleNamespace(status_code=401, text="", json=lambda: {"error": "invalid_client", "error_description": "AADSTS7000215"})
+        with mock.patch.object(requests, "post", return_value=bad):
+            with self.assertRaises(RuntimeError) as cm:
+                fetch_token("https://login/x", "id", "SECRET")
+        self.assertIn("invalid_client", str(cm.exception))
+        self.assertNotIn("SECRET", str(cm.exception))
+
+    def test_client_renews_an_expiring_token_once(self):
+        import time
+        class R:
+            status_code, headers, encoding = 200, {}, "utf-8"
+            def iter_content(self, n): return [b"{}"]
+            def close(self): pass
+        c = Client("https://h", jwt(time.time() + 10))
+        c.s.request = lambda *a, **k: (seen.append(k["headers"]["Authorization"]), R())[1]
+        seen, calls = [], []
+        c.refresh = lambda: (calls.append(1), jwt(time.time() + 3600))[1]
+        c.get("x")
+        c.get("x")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(set(seen)), 1)
+        self.assertNotIn(jwt(0)[:20] + "x", seen)
+        c2 = Client("https://h", jwt(time.time() + 10))
+        c2.refresh = lambda: (_ for _ in ()).throw(RuntimeError("down"))
+        with self.assertRaises(TokenExpired):
+            c2.get("x")
 
 
 class DiscoveryTests(unittest.TestCase):

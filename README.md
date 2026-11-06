@@ -12,10 +12,17 @@ the opt-in `--batch` test: a single POST to `$batch` that carries only GET reque
 
 - **Software:** Python 3.11+ and `pip install -r requirements.txt`. The automatic tunnel also needs
   AWS CLI v2 and the Session Manager plugin.
-- **Token:** put your bearer token in `.env`, next to this README:
+- **Token:** either put a bearer token in `.env` (`ODATA_TOKEN=eyJ...`), or let the tool request one with
+  the client-credentials flow. Fill these in `.env` (names are listed in `.env.example`):
   ```
-  ODATA_TOKEN=eyJ...
+  ODATA_TOKEN_URL=https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
+  ODATA_GRANT_TYPE=client_credentials
+  ODATA_CLIENT_ID=...
+  ODATA_CLIENT_SECRET=...
+  ODATA_SCOPE=api://<app-id>/.default
   ```
+  A valid `ODATA_TOKEN` is used as is. If it is empty or expired, a new token is requested at the start, and
+  it is renewed automatically during a long run. The secret is never printed or written to a report.
   Never commit `.env`.
 - **AWS login:** log in once with `aws sso login --profile odh-uat`.
 
@@ -111,7 +118,8 @@ the default for day-to-day checks.
 | `-v` | | print every test, not only WARN and FAIL |
 
 Every option can also come from `.env`: `ODATA_URL`, `ODATA_BASE_URL`, `ODATA_CONNECT`, `ODATA_SSM_TARGET`,
-`ODATA_SSM_PROFILE`, `ODATA_SSM_REGION`, `ODATA_LOCAL_PORT`.
+`ODATA_SSM_PROFILE`, `ODATA_SSM_REGION`, `ODATA_LOCAL_PORT`, and the token settings above. With the SSM and
+token settings in `.env`, a run is just `python -m odh_odata <url>`.
 
 The exit code is `1` if any test fails. With `--baseline` it is `1` only for new FAILs (see below).
 

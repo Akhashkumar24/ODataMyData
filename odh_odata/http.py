@@ -73,6 +73,7 @@ class Client:
         else:
             self.s.mount(self.wire, HTTPAdapter(pool_maxsize=32))
         self.token, self.timeout, self.max_requests = token, timeout, max_requests
+        self.refresh = None  # optional callable returning a fresh token (client-credentials flow)
         self.connect = connect
         self.extra = dict(headers or {})  # user headers sent on every request
         self.exp = token_claims(token).get("exp") if token else None
@@ -100,8 +101,16 @@ class Client:
             self.count += 1
             if self.count > self.max_requests:
                 raise BudgetExceeded("request budget exhausted (--max-requests)")
-        if auth and not token and self.exp and time.time() > self.exp - 15:
-            raise TokenExpired("bearer token expired during the run - remaining tests skipped")
+        if auth and not token and self.exp and time.time() > self.exp - (60 if self.refresh else 15):
+            with self._lock:  # one thread refreshes; the others see the new expiry
+                if self.refresh and time.time() > self.exp - 60:
+                    try:
+                        self.token = self.refresh()
+                    except RuntimeError as e:
+                        raise TokenExpired(f"token refresh failed ({e}) - remaining tests skipped")
+                    self.exp = token_claims(self.token).get("exp")
+            if time.time() > self.exp - 15:
+                raise TokenExpired("bearer token expired during the run - remaining tests skipped")
         if auth and not token and self.rejected:
             raise TokenExpired("bearer token rejected with 401 (revoked or wrong audience) - remaining tests skipped")
         h = {"Accept": "application/json", **self.extra}
@@ -148,6 +157,24 @@ def load_dotenv(path=".env"):
             continue
         k, _, v = line.partition("=")
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def fetch_token(url, client_id, client_secret, scope=None, grant_type="client_credentials", timeout=30):
+    """OAuth2 token request (Azure AD v2). Raises RuntimeError with a message that never contains the secret."""
+    form = {"client_id": client_id, "client_secret": client_secret, "grant_type": grant_type}
+    if scope:
+        form["scope"] = scope
+    try:
+        r = requests.post(url, data=form, timeout=timeout)
+    except requests.RequestException as e:
+        raise RuntimeError(f"token request failed: {type(e).__name__}") from None
+    try:
+        j = r.json()
+    except ValueError:
+        j = {}
+    if r.status_code != 200 or not j.get("access_token"):
+        raise RuntimeError(f"token request returned {r.status_code}: {j.get('error')} {str(j.get('error_description') or r.text)[:200]}".strip())
+    return j["access_token"]
 
 
 def clean_token(t):
